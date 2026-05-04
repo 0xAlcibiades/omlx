@@ -320,3 +320,83 @@ class TestDFlashEnginePoolRouting:
         )
         assert settings.dflash_enabled is True
         assert settings.dflash_draft_model == "z-lab/Qwen3.5-4B-DFlash"
+
+
+class TestImageContentDetection:
+    """Helpers that decide whether a chat request carries vision content.
+
+    These gate DFlash's vision-fallback path: when any message contains an
+    image content part, DFlash must delegate to its VLM fallback rather than
+    flatten the messages through ``_apply_chat_template`` (which silently
+    drops the image).
+    """
+
+    def _import_helpers(self):
+        try:
+            from omlx.engine.dflash import (
+                _content_has_image_part,
+                _messages_have_images,
+            )
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        return _content_has_image_part, _messages_have_images
+
+    def test_text_only_string_content(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part("hello") is False
+
+    def test_text_only_list_content(self):
+        _content_has_image_part, _ = self._import_helpers()
+        content = [{"type": "text", "text": "hi"}]
+        assert _content_has_image_part(content) is False
+
+    def test_image_url_part(self):
+        _content_has_image_part, _ = self._import_helpers()
+        content = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ]
+        assert _content_has_image_part(content) is True
+
+    def test_image_part_alias(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part([{"type": "image", "image": "..."}]) is True
+
+    def test_input_image_part_alias(self):
+        _content_has_image_part, _ = self._import_helpers()
+        assert _content_has_image_part([{"type": "input_image", "image": "..."}]) is True
+
+    def test_messages_have_images_false_for_text_only(self):
+        _, _messages_have_images = self._import_helpers()
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hi"},
+        ]
+        assert _messages_have_images(messages) is False
+
+    def test_messages_have_images_true_when_any_message_has_image(self):
+        _, _messages_have_images = self._import_helpers()
+        messages = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "what's here?"},
+                {"type": "image_url", "image_url": {"url": "https://..."}},
+            ]},
+        ]
+        assert _messages_have_images(messages) is True
+
+    def test_messages_have_images_handles_non_dict_messages(self):
+        _, _messages_have_images = self._import_helpers()
+        # Defensive: callers occasionally pass strings or odd shapes
+        assert _messages_have_images(["plain string", None]) is False  # type: ignore[list-item]
+
+    def test_object_with_type_attr_treated_as_image(self):
+        """Pydantic-style content parts use attribute access, not dict get."""
+        _content_has_image_part, _ = self._import_helpers()
+
+        class _Part:
+            def __init__(self, t):
+                self.type = t
+
+        assert _content_has_image_part([_Part("image_url")]) is True
+        assert _content_has_image_part([_Part("text")]) is False

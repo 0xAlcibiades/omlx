@@ -28,6 +28,35 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+_IMAGE_PART_TYPES: frozenset[str] = frozenset({"image", "image_url", "input_image"})
+
+
+def _content_has_image_part(content: Any) -> bool:
+    """Return True if a chat message's content contains a vision part.
+
+    Mirrors the part-type set used by ``VLMBatchedEngine._count_content_parts``
+    so that DFlash's image detection stays in lockstep with the VLM engine.
+    """
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+        else:
+            item_type = getattr(item, "type", "")
+        if item_type in _IMAGE_PART_TYPES:
+            return True
+    return False
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    """Return True if any message in ``messages`` contains image content."""
+    return any(
+        isinstance(msg, dict) and _content_has_image_part(msg.get("content"))
+        for msg in messages
+    )
+
+
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
@@ -752,6 +781,38 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Vision requests cannot be served through DFlash speculation: the
+        # chat-template flattening below renders image content blocks to text
+        # placeholders before the target model's vision encoder ever sees the
+        # image bytes. Detect images and route to the VLM fallback (which is
+        # the same one already used for long-context overflow).
+        if _messages_have_images(messages):
+            if self._fallback_engine_type != "vlm":
+                raise RuntimeError(
+                    "DFlash received an image-bearing request but its configured "
+                    "fallback engine type is not 'vlm' — the underlying model is "
+                    "not multimodal. Disable DFlash for this model or send a "
+                    "text-only request."
+                )
+            if not self._in_fallback_mode:
+                logger.info(
+                    "DFlash vision fallback: image content detected in messages; "
+                    "evicting DFlash models and switching to VLM engine"
+                )
+                await self._evict_dflash_and_start_fallback()
+            return await self._fallback_engine.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            )
+
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -780,6 +841,38 @@ class DFlashEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+
+        # See chat() for rationale: image content cannot survive DFlash's
+        # chat-template flattening, so route image-bearing requests to the
+        # VLM fallback. Mirrors the long-context fallback transition.
+        if _messages_have_images(messages):
+            if self._fallback_engine_type != "vlm":
+                raise RuntimeError(
+                    "DFlash received an image-bearing request but its configured "
+                    "fallback engine type is not 'vlm' — the underlying model is "
+                    "not multimodal. Disable DFlash for this model or send a "
+                    "text-only request."
+                )
+            if not self._in_fallback_mode:
+                logger.info(
+                    "DFlash vision fallback: image content detected in messages; "
+                    "evicting DFlash models and switching to VLM engine"
+                )
+                await self._evict_dflash_and_start_fallback()
+            async for output in self._fallback_engine.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                tools=tools,
+                **kwargs,
+            ):
+                yield output
+            return
 
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
