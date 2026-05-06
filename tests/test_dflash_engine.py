@@ -727,6 +727,26 @@ class TestDFlashFallbackCoexistence:
         assert len(recorder) == 1
         assert len(recorder[0].chat_calls) == 2
 
+    def test_supports_vision_true_when_fallback_is_vlm(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        engine = DFlashEngine(
+            model_name="m", draft_model_path="d", fallback_engine_type="vlm",
+        )
+        assert engine.supports_vision is True
+
+    def test_supports_vision_false_when_fallback_is_batched(self):
+        try:
+            from omlx.engine.dflash import DFlashEngine
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        engine = DFlashEngine(
+            model_name="m", draft_model_path="d", fallback_engine_type="batched",
+        )
+        assert engine.supports_vision is False
+
     async def test_get_stats_reports_sidecar_loaded(self, monkeypatch):
         """get_stats() must distinguish 'sidecar started for vision' from
         'in fallback mode' (long-context eviction)."""

@@ -161,6 +161,16 @@ class DFlashEngine(BaseEngine):
     def model_type(self) -> str | None:
         return self._model_type_str
 
+    @property
+    def supports_vision(self) -> bool:
+        """DFlash is text-only, but its sidecar handles vision when the
+        underlying model is multimodal (``fallback_engine_type=='vlm'``).
+        Tells the API layer to preserve image content parts so vision
+        routing in ``chat`` / ``stream_chat`` can deliver them to the
+        sidecar instead of being stripped upstream.
+        """
+        return self._fallback_engine_type == "vlm"
+
     @staticmethod
     def _bits_to_quant_spec(bits: int | None) -> str | None:
         """Convert legacy bits config into dflash 0.1.5's spec string format."""
@@ -536,6 +546,9 @@ class DFlashEngine(BaseEngine):
         next request.
         """
         event_iter = None
+        # Capture once so stop()/eviction can null self._executor_tokenizer
+        # without crashing an in-flight worker on the executor thread.
+        executor_tokenizer = self._executor_tokenizer
         try:
             event_iter, prefix_flow, stop_ids = self._stream_dflash_events(
                 prompt_tokens=prompt_tokens,
@@ -546,7 +559,7 @@ class DFlashEngine(BaseEngine):
             detokenizer = None
             try:
                 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
-                detokenizer = NaiveStreamingDetokenizer(self._executor_tokenizer)
+                detokenizer = NaiveStreamingDetokenizer(executor_tokenizer)
             except ImportError:
                 pass
 
@@ -573,7 +586,7 @@ class DFlashEngine(BaseEngine):
                         detokenizer.add_token(token_id)
                         text = detokenizer.last_segment
                     else:
-                        text = self._executor_tokenizer.decode([token_id])
+                        text = executor_tokenizer.decode([token_id])
                     asyncio.run_coroutine_threadsafe(
                         queue.put((text, [token_id], False, None)), loop
                     )
@@ -643,7 +656,10 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        # Capture tokenizer locally so stop()/eviction can null self._tokenizer_obj
+        # mid-generation without crashing the post-decode finalization below.
+        tokenizer = self._tokenizer_obj
+        prompt_tokens = tokenizer.encode(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -729,7 +745,7 @@ class DFlashEngine(BaseEngine):
             raise
         summary = summary or {}
 
-        text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+        text = tokenizer.decode(generated, skip_special_tokens=True)
         text = clean_special_tokens(text)
 
         # Reasoning models (Qwen3.x with enable_thinking, DeepSeek, MiniMax, ...)
